@@ -1,0 +1,693 @@
+# Parcelo Shipping Analytics — additional metric definitions
+#
+# Source warehouse: Snowflake, database PARCELO_POC.
+# These metrics extend the Parcelo domain. They deliberately avoid redefining
+# metrics that already exist there (shipment count, label cost, effective cost,
+# on-time rate, exception rate, refund rate, adjustment/leakage rate, savings
+# vs retail, potential savings, dim-weight ratio, days late, etc.).
+#
+# Conventions used throughout (consistent with the existing domain):
+#   * Voided labels (IS_REFUNDED = TRUE) never shipped and are excluded from
+#     cost, volume-mix and delivery-performance metrics.
+#   * Delivery-performance metrics only count shipments with a non-null
+#     DELIVERY_DATE.
+#   * Adjustment categories: CORRECTION (ADDR_CORR, REWEIGH) is avoidable and
+#     data-quality driven; ACCESSORIAL (RESIDENTIAL, DIM) is structural;
+#     SURCHARGE (FUEL, PEAK) is indexed or seasonal.
+#   * Zones 1-5 are "near", zones 6-8 are "far".
+#
+# Each metric carries meta.sql_expression: the exact aggregate SQL (Snowflake
+# dialect, TABLE.COLUMN references) to use as the metric definition.
+
+version: 2
+
+semantic_models:
+
+  # ---------------------------------------------------------------------------
+  - name: adjustments
+    description: >
+      One row per post-purchase carrier adjustment (surcharge, accessorial or
+      correction) applied to a shipment. ADJUSTMENT_DATE is when the carrier
+      billed the charge and usually falls days to weeks after SHIP_DATE.
+    model: ref('ADJUSTMENTS')
+    defaults:
+      agg_time_dimension: adjustment_date
+    entities:
+      - name: adjustment
+        type: primary
+        expr: ADJUSTMENT_ID
+      - name: shipment
+        type: foreign
+        expr: SHIPMENT_ID
+    dimensions:
+      - name: adjustment_date
+        type: time
+        expr: ADJUSTMENT_DATE
+        type_params:
+          time_granularity: day
+      - name: adjustment_type_id
+        type: categorical
+        expr: ADJUSTMENT_TYPE_ID
+    measures:
+      - name: avoidable_adjustment_amount
+        description: Adjustment dollars from CORRECTION-category types (address corrections and reweighs).
+        agg: sum
+        expr: "CASE WHEN ADJUSTMENT_TYPE_ID IN ('ADDR_CORR', 'REWEIGH') THEN ADJUSTMENT_AMOUNT ELSE 0 END"
+      - name: adjustment_amount
+        agg: sum
+        expr: ADJUSTMENT_AMOUNT
+      - name: address_corrections
+        agg: sum
+        expr: "CASE WHEN ADJUSTMENT_TYPE_ID = 'ADDR_CORR' THEN 1 ELSE 0 END"
+      - name: reweighs
+        agg: sum
+        expr: "CASE WHEN ADJUSTMENT_TYPE_ID = 'REWEIGH' THEN 1 ELSE 0 END"
+      - name: peak_surcharge_amount
+        agg: sum
+        expr: "CASE WHEN ADJUSTMENT_TYPE_ID = 'PEAK' THEN ADJUSTMENT_AMOUNT ELSE 0 END"
+      - name: dim_weight_adjustment_amount
+        agg: sum
+        expr: "CASE WHEN ADJUSTMENT_TYPE_ID = 'DIM' THEN ADJUSTMENT_AMOUNT ELSE 0 END"
+
+  # ---------------------------------------------------------------------------
+  - name: shipment_enriched
+    description: >
+      One row per shipment with account, location, carrier, service and
+      rolled-up adjustment attributes (view V_SHIPMENT_ENRICHED). Default
+      source for shipment-level cost questions.
+    model: ref('V_SHIPMENT_ENRICHED')
+    defaults:
+      agg_time_dimension: ship_date
+    entities:
+      - name: shipment
+        type: primary
+        expr: SHIPMENT_ID
+    dimensions:
+      - name: ship_date
+        type: time
+        expr: SHIP_DATE
+        type_params:
+          time_granularity: day
+      - name: service_category
+        type: categorical
+        expr: SERVICE_CATEGORY
+      - name: zone
+        type: categorical
+        expr: ZONE
+      - name: is_refunded
+        type: categorical
+        expr: IS_REFUNDED
+    measures:
+      - name: shipped_labels
+        description: Non-refunded shipments.
+        agg: sum
+        expr: "CASE WHEN IS_REFUNDED = FALSE THEN 1 ELSE 0 END"
+      - name: adjusted_shipments
+        agg: sum
+        expr: "CASE WHEN IS_REFUNDED = FALSE AND TOTAL_ADJUSTMENTS > 0 THEN 1 ELSE 0 END"
+      - name: adjusted_shipment_adjustment_amount
+        agg: sum
+        expr: "CASE WHEN IS_REFUNDED = FALSE AND TOTAL_ADJUSTMENTS > 0 THEN TOTAL_ADJUSTMENTS ELSE 0 END"
+      - name: shipped_effective_cost
+        agg: sum
+        expr: "CASE WHEN IS_REFUNDED = FALSE THEN EFFECTIVE_COST ELSE 0 END"
+      - name: shipped_billed_pounds
+        agg: sum
+        expr: "CASE WHEN IS_REFUNDED = FALSE THEN BILLED_WEIGHT_OZ / 16.0 ELSE 0 END"
+      - name: average_billed_weight_lb_measure
+        agg: average
+        expr: "CASE WHEN IS_REFUNDED = FALSE THEN BILLED_WEIGHT_OZ / 16.0 END"
+      - name: premium_service_shipments
+        agg: sum
+        expr: "CASE WHEN IS_REFUNDED = FALSE AND SERVICE_CATEGORY IN ('EXPEDITED', 'OVERNIGHT') THEN 1 ELSE 0 END"
+      - name: far_zone_shipments
+        agg: sum
+        expr: "CASE WHEN IS_REFUNDED = FALSE AND ZONE >= 6 THEN 1 ELSE 0 END"
+
+  # ---------------------------------------------------------------------------
+  - name: shipments
+    description: One row per purchased shipping label (raw SHIPMENTS table).
+    model: ref('SHIPMENTS')
+    defaults:
+      agg_time_dimension: ship_date
+    entities:
+      - name: shipment
+        type: primary
+        expr: SHIPMENT_ID
+      - name: customer
+        type: foreign
+        expr: CUSTOMER_ID
+    dimensions:
+      - name: ship_date
+        type: time
+        expr: SHIP_DATE
+        type_params:
+          time_granularity: day
+      - name: status
+        type: categorical
+        expr: STATUS
+    measures:
+      - name: delivered_shipments
+        agg: sum
+        expr: "CASE WHEN DELIVERY_DATE IS NOT NULL THEN 1 ELSE 0 END"
+      - name: delivery_variance_days
+        agg: average
+        expr: "CASE WHEN DELIVERY_DATE IS NOT NULL THEN DATEDIFF('day', EST_DELIVERY_DATE, DELIVERY_DATE) END"
+      - name: late_shipments
+        agg: sum
+        expr: "CASE WHEN DELIVERY_DATE > EST_DELIVERY_DATE THEN 1 ELSE 0 END"
+      - name: in_transit_shipments
+        agg: sum
+        expr: "CASE WHEN STATUS = 'IN_TRANSIT' THEN 1 ELSE 0 END"
+      - name: shipped_list_rate
+        agg: sum
+        expr: "CASE WHEN IS_REFUNDED = FALSE THEN LIST_RATE_AT_PURCHASE ELSE 0 END"
+      - name: shipped_retail_savings
+        agg: sum
+        expr: "CASE WHEN IS_REFUNDED = FALSE THEN LIST_RATE_AT_PURCHASE - LABEL_COST ELSE 0 END"
+      - name: active_sellers
+        agg: count_distinct
+        expr: "CASE WHEN IS_REFUNDED = FALSE THEN CUSTOMER_ID END"
+
+  # ---------------------------------------------------------------------------
+  - name: carrier_savings
+    description: >
+      One row per non-refunded GROUND shipment compared against the cheapest
+      eligible ground negotiated rate for the same zone and billed-weight band
+      (view V_CARRIER_SAVINGS).
+    model: ref('V_CARRIER_SAVINGS')
+    defaults:
+      agg_time_dimension: ship_date
+    entities:
+      - name: shipment
+        type: primary
+        expr: SHIPMENT_ID
+    dimensions:
+      - name: ship_date
+        type: time
+        expr: SHIP_DATE
+        type_params:
+          time_granularity: day
+    measures:
+      - name: ground_shipments
+        agg: count
+        expr: SHIPMENT_ID
+      - name: overpaid_ground_shipments
+        agg: sum
+        expr: "CASE WHEN POTENTIAL_SAVINGS > 0 THEN 1 ELSE 0 END"
+      - name: ground_potential_savings
+        agg: sum
+        expr: POTENTIAL_SAVINGS
+
+  # ---------------------------------------------------------------------------
+  - name: tracking_events
+    description: One row per carrier scan event. Never join to SHIPMENTS for cost aggregation (fan-out).
+    model: ref('TRACKING_EVENTS')
+    defaults:
+      agg_time_dimension: event_timestamp
+    entities:
+      - name: tracking_event
+        type: primary
+        expr: EVENT_ID
+      - name: shipment
+        type: foreign
+        expr: SHIPMENT_ID
+    dimensions:
+      - name: event_timestamp
+        type: time
+        expr: EVENT_TIMESTAMP
+        type_params:
+          time_granularity: day
+    measures:
+      - name: scan_events
+        agg: count
+        expr: EVENT_ID
+      - name: scanned_shipments
+        agg: count_distinct
+        expr: SHIPMENT_ID
+
+metrics:
+
+  # ===========================================================================
+  # Adjustment / surcharge leakage
+  # ===========================================================================
+  - name: avoidable_adjustment_spend
+    label: Avoidable adjustment spend
+    description: >
+      Total post-purchase CORRECTION charges in USD — address corrections
+      (ADDR_CORR) and reweighs (REWEIGH). These are avoidable, data-quality
+      driven costs (bad checkout addresses, stale catalog weights) and are the
+      "fixable" part of adjustment leakage. Synonyms: avoidable charges,
+      correction charges, preventable fees.
+    type: simple
+    type_params:
+      measure: avoidable_adjustment_amount
+    meta:
+      table: ADJUSTMENTS
+      format: currency_usd
+      sql_expression: >-
+        SUM(CASE WHEN ADJUSTMENTS.ADJUSTMENT_TYPE_ID IN ('ADDR_CORR', 'REWEIGH')
+        THEN ADJUSTMENTS.ADJUSTMENT_AMOUNT ELSE 0 END)
+
+  - name: avoidable_adjustment_share
+    label: Avoidable share of adjustments
+    description: >
+      Share of all post-purchase adjustment dollars that come from avoidable
+      CORRECTION types (ADDR_CORR, REWEIGH). High values mean leakage is mostly
+      fixable process/data-quality problems rather than structural accessorials
+      or indexed surcharges. Platform-wide ~24%; varies widely by account.
+    type: ratio
+    type_params:
+      numerator: avoidable_adjustment_spend
+      denominator: total_adjustment_amount_base
+    meta:
+      table: ADJUSTMENTS
+      format: percent
+      sql_expression: >-
+        SUM(CASE WHEN ADJUSTMENTS.ADJUSTMENT_TYPE_ID IN ('ADDR_CORR', 'REWEIGH')
+        THEN ADJUSTMENTS.ADJUSTMENT_AMOUNT ELSE 0 END)
+        / NULLIF(SUM(ADJUSTMENTS.ADJUSTMENT_AMOUNT), 0)
+
+  - name: total_adjustment_amount_base
+    label: Total adjustment amount (base)
+    description: Helper for ratio metrics; equals the domain's existing "Total adjustments" metric.
+    type: simple
+    type_params:
+      measure: adjustment_amount
+    meta:
+      hidden: true
+      table: ADJUSTMENTS
+      sql_expression: SUM(ADJUSTMENTS.ADJUSTMENT_AMOUNT)
+
+  - name: address_correction_count
+    label: Address correction count
+    description: >
+      Number of address-correction adjustments (ADJUSTMENT_TYPE_ID = 'ADDR_CORR')
+      billed by carriers. Signals order-capture problems such as missing
+      checkout address validation or dropped apartment numbers.
+    type: simple
+    type_params:
+      measure: address_corrections
+    meta:
+      table: ADJUSTMENTS
+      format: integer
+      sql_expression: >-
+        COUNT(CASE WHEN ADJUSTMENTS.ADJUSTMENT_TYPE_ID = 'ADDR_CORR'
+        THEN ADJUSTMENTS.ADJUSTMENT_ID END)
+
+  - name: reweigh_count
+    label: Reweigh count
+    description: >
+      Number of reweigh adjustments (ADJUSTMENT_TYPE_ID = 'REWEIGH') where the
+      carrier billed above the declared weight. Usually indicates stale catalog
+      weights or packaging weight omitted from item weights.
+    type: simple
+    type_params:
+      measure: reweighs
+    meta:
+      table: ADJUSTMENTS
+      format: integer
+      sql_expression: >-
+        COUNT(CASE WHEN ADJUSTMENTS.ADJUSTMENT_TYPE_ID = 'REWEIGH'
+        THEN ADJUSTMENTS.ADJUSTMENT_ID END)
+
+  - name: peak_surcharge_spend
+    label: Peak surcharge spend
+    description: >
+      Total peak-season surcharge dollars (ADJUSTMENT_TYPE_ID = 'PEAK'). Use
+      ADJUSTMENT_DATE to report when charges were billed, or join to the
+      shipment's SHIP_DATE to attribute them to a shipping season (peak =
+      October through December).
+    type: simple
+    type_params:
+      measure: peak_surcharge_amount
+    meta:
+      table: ADJUSTMENTS
+      format: currency_usd
+      sql_expression: >-
+        SUM(CASE WHEN ADJUSTMENTS.ADJUSTMENT_TYPE_ID = 'PEAK'
+        THEN ADJUSTMENTS.ADJUSTMENT_AMOUNT ELSE 0 END)
+
+  - name: dim_weight_adjustment_spend
+    label: Dimensional weight adjustment spend
+    description: >
+      Total dimensional-weight adjustment dollars (ADJUSTMENT_TYPE_ID = 'DIM')
+      — charges applied after purchase because package volume, not scale
+      weight, set the price. The largest single adjustment type on the
+      platform; strongly associated with low-density parcels (e.g. bedding).
+    type: simple
+    type_params:
+      measure: dim_weight_adjustment_amount
+    meta:
+      table: ADJUSTMENTS
+      format: currency_usd
+      sql_expression: >-
+        SUM(CASE WHEN ADJUSTMENTS.ADJUSTMENT_TYPE_ID = 'DIM'
+        THEN ADJUSTMENTS.ADJUSTMENT_AMOUNT ELSE 0 END)
+
+  - name: adjustment_incidence_rate
+    label: Adjustment incidence rate
+    description: >
+      Share of shipped (non-refunded) labels that received at least one
+      post-purchase carrier adjustment. Complements the dollar-based
+      adjustment/leakage rate: this measures how often, not how much.
+    type: ratio
+    type_params:
+      numerator: adjusted_shipment_count_base
+      denominator: shipped_label_count_base
+    meta:
+      table: V_SHIPMENT_ENRICHED
+      format: percent
+      sql_expression: >-
+        COUNT(CASE WHEN V_SHIPMENT_ENRICHED.IS_REFUNDED = FALSE
+        AND V_SHIPMENT_ENRICHED.TOTAL_ADJUSTMENTS > 0 THEN 1 END)
+        / NULLIF(COUNT(CASE WHEN V_SHIPMENT_ENRICHED.IS_REFUNDED = FALSE THEN 1 END), 0)
+
+  - name: average_adjustment_per_adjusted_shipment
+    label: Average adjustment per adjusted shipment
+    description: >
+      Average total adjustment dollars on shipments that were adjusted at all
+      (non-refunded shipments with TOTAL_ADJUSTMENTS > 0). Measures severity
+      of adjustments when they occur.
+    type: ratio
+    type_params:
+      numerator: adjusted_shipment_adjustment_base
+      denominator: adjusted_shipment_count_base
+    meta:
+      table: V_SHIPMENT_ENRICHED
+      format: currency_usd
+      sql_expression: >-
+        SUM(CASE WHEN V_SHIPMENT_ENRICHED.IS_REFUNDED = FALSE
+        AND V_SHIPMENT_ENRICHED.TOTAL_ADJUSTMENTS > 0
+        THEN V_SHIPMENT_ENRICHED.TOTAL_ADJUSTMENTS ELSE 0 END)
+        / NULLIF(COUNT(CASE WHEN V_SHIPMENT_ENRICHED.IS_REFUNDED = FALSE
+        AND V_SHIPMENT_ENRICHED.TOTAL_ADJUSTMENTS > 0 THEN 1 END), 0)
+
+  # ===========================================================================
+  # Cost efficiency and shipment mix
+  # ===========================================================================
+  - name: effective_cost_per_billed_pound
+    label: Effective cost per billed pound
+    description: >
+      All-in shipping cost (label + adjustments) per billed pound for shipped
+      labels. Normalizes cost for weight mix, so it is a fairer comparison
+      across merchants and locations than cost per label. Still sensitive to
+      zone and service mix.
+    type: ratio
+    type_params:
+      numerator: shipped_effective_cost_base
+      denominator: shipped_billed_pounds_base
+    meta:
+      table: V_SHIPMENT_ENRICHED
+      format: currency_usd
+      sql_expression: >-
+        SUM(CASE WHEN V_SHIPMENT_ENRICHED.IS_REFUNDED = FALSE
+        THEN V_SHIPMENT_ENRICHED.EFFECTIVE_COST ELSE 0 END)
+        / NULLIF(SUM(CASE WHEN V_SHIPMENT_ENRICHED.IS_REFUNDED = FALSE
+        THEN V_SHIPMENT_ENRICHED.BILLED_WEIGHT_OZ / 16.0 ELSE 0 END), 0)
+
+  - name: average_billed_weight_lb
+    label: Average billed weight (lb)
+    description: >
+      Average carrier-billed weight in pounds (BILLED_WEIGHT_OZ / 16) for
+      shipped labels. Billed weight is GREATEST(actual, dimensional) weight.
+    type: simple
+    type_params:
+      measure: average_billed_weight_lb_measure
+    meta:
+      table: V_SHIPMENT_ENRICHED
+      format: decimal_2
+      sql_expression: >-
+        AVG(CASE WHEN V_SHIPMENT_ENRICHED.IS_REFUNDED = FALSE
+        THEN V_SHIPMENT_ENRICHED.BILLED_WEIGHT_OZ / 16.0 END)
+
+  - name: premium_service_share
+    label: Premium service share
+    description: >
+      Share of shipped labels using EXPEDITED or OVERNIGHT service rather than
+      GROUND. A rising share drives cost up independently of rates. Synonyms:
+      expedited mix, express share, air mix.
+    type: ratio
+    type_params:
+      numerator: premium_service_shipment_base
+      denominator: shipped_label_count_base
+    meta:
+      table: V_SHIPMENT_ENRICHED
+      format: percent
+      sql_expression: >-
+        COUNT(CASE WHEN V_SHIPMENT_ENRICHED.IS_REFUNDED = FALSE
+        AND V_SHIPMENT_ENRICHED.SERVICE_CATEGORY IN ('EXPEDITED', 'OVERNIGHT') THEN 1 END)
+        / NULLIF(COUNT(CASE WHEN V_SHIPMENT_ENRICHED.IS_REFUNDED = FALSE THEN 1 END), 0)
+
+  - name: far_zone_share
+    label: Far-zone share
+    description: >
+      Share of shipped labels going to far zones (ZONE 6-8, cross-country).
+      Higher far-zone share raises cost per label and transit time; useful for
+      evaluating ship-from location placement.
+    type: ratio
+    type_params:
+      numerator: far_zone_shipment_base
+      denominator: shipped_label_count_base
+    meta:
+      table: V_SHIPMENT_ENRICHED
+      format: percent
+      sql_expression: >-
+        COUNT(CASE WHEN V_SHIPMENT_ENRICHED.IS_REFUNDED = FALSE
+        AND V_SHIPMENT_ENRICHED.ZONE >= 6 THEN 1 END)
+        / NULLIF(COUNT(CASE WHEN V_SHIPMENT_ENRICHED.IS_REFUNDED = FALSE THEN 1 END), 0)
+
+  - name: discount_off_retail_pct
+    label: Discount off retail %
+    description: >
+      Parcelo's negotiated discount versus carrier retail (list) rates, as a
+      percentage of retail, for shipped labels. The percentage form of the
+      existing "Savings vs retail" dollar metric. Synonyms: negotiated
+      discount, rate discount, savings rate vs list.
+    type: ratio
+    type_params:
+      numerator: shipped_retail_savings_base
+      denominator: shipped_list_rate_base
+    meta:
+      table: SHIPMENTS
+      format: percent
+      sql_expression: >-
+        SUM(CASE WHEN SHIPMENTS.IS_REFUNDED = FALSE
+        THEN SHIPMENTS.LIST_RATE_AT_PURCHASE - SHIPMENTS.LABEL_COST ELSE 0 END)
+        / NULLIF(SUM(CASE WHEN SHIPMENTS.IS_REFUNDED = FALSE
+        THEN SHIPMENTS.LIST_RATE_AT_PURCHASE ELSE 0 END), 0)
+
+  # ===========================================================================
+  # Delivery performance
+  # ===========================================================================
+  - name: late_delivery_rate
+    label: Late delivery rate
+    description: >
+      Share of delivered shipments (non-null DELIVERY_DATE) that arrived after
+      the carrier's estimated delivery date. Complement of the on-time rate.
+      Above ~10% is a service concern; above ~20% signals a service problem.
+    type: ratio
+    type_params:
+      numerator: late_shipment_base
+      denominator: delivered_shipment_count
+    meta:
+      table: SHIPMENTS
+      format: percent
+      sql_expression: >-
+        COUNT(CASE WHEN SHIPMENTS.DELIVERY_DATE > SHIPMENTS.EST_DELIVERY_DATE THEN 1 END)
+        / NULLIF(COUNT(CASE WHEN SHIPMENTS.DELIVERY_DATE IS NOT NULL THEN 1 END), 0)
+
+  - name: average_delivery_variance_days
+    label: Average delivery variance (days)
+    description: >
+      Average of (DELIVERY_DATE - EST_DELIVERY_DATE) in days across all
+      delivered shipments. Positive means carriers deliver later than promised
+      on average; negative means earlier. Unlike "Average days late", early
+      and on-time deliveries are included.
+    type: simple
+    type_params:
+      measure: delivery_variance_days
+    meta:
+      table: SHIPMENTS
+      format: decimal_2
+      sql_expression: >-
+        AVG(CASE WHEN SHIPMENTS.DELIVERY_DATE IS NOT NULL
+        THEN DATEDIFF('day', SHIPMENTS.EST_DELIVERY_DATE, SHIPMENTS.DELIVERY_DATE) END)
+
+  - name: delivered_shipment_count
+    label: Delivered shipment count
+    description: Number of shipments with a non-null DELIVERY_DATE (the denominator for on-time and late rates).
+    type: simple
+    type_params:
+      measure: delivered_shipments
+    meta:
+      table: SHIPMENTS
+      format: integer
+      sql_expression: >-
+        COUNT(CASE WHEN SHIPMENTS.DELIVERY_DATE IS NOT NULL THEN SHIPMENTS.SHIPMENT_ID END)
+
+  - name: in_transit_shipment_count
+    label: In-transit shipment count
+    description: >
+      Number of shipments currently in transit (STATUS = 'IN_TRANSIT'), i.e.
+      tendered but not yet delivered and not in exception.
+    type: simple
+    type_params:
+      measure: in_transit_shipments
+    meta:
+      table: SHIPMENTS
+      format: integer
+      sql_expression: >-
+        COUNT(CASE WHEN SHIPMENTS.STATUS = 'IN_TRANSIT' THEN SHIPMENTS.SHIPMENT_ID END)
+
+  - name: tracking_scans_per_shipment
+    label: Tracking scans per shipment
+    description: >
+      Average number of carrier scan events per tracked shipment. Use for
+      tracking-visibility questions only; never join TRACKING_EVENTS to
+      shipment costs.
+    type: ratio
+    type_params:
+      numerator: scan_event_base
+      denominator: scanned_shipment_base
+    meta:
+      table: TRACKING_EVENTS
+      format: decimal_1
+      sql_expression: >-
+        COUNT(TRACKING_EVENTS.EVENT_ID)
+        / NULLIF(COUNT(DISTINCT TRACKING_EVENTS.SHIPMENT_ID), 0)
+
+  # ===========================================================================
+  # Carrier selection
+  # ===========================================================================
+  - name: carrier_selection_miss_rate
+    label: Carrier selection miss rate
+    description: >
+      Share of ground shipments in V_CARRIER_SAVINGS where a cheaper eligible
+      ground carrier existed for the same zone and billed-weight band
+      (POTENTIAL_SAVINGS > 0). Measures how often the merchant picked a
+      non-optimal ground carrier; ground-to-ground only.
+    type: ratio
+    type_params:
+      numerator: overpaid_ground_shipment_base
+      denominator: ground_shipment_base
+    meta:
+      table: V_CARRIER_SAVINGS
+      format: percent
+      sql_expression: >-
+        COUNT(CASE WHEN V_CARRIER_SAVINGS.POTENTIAL_SAVINGS > 0 THEN 1 END)
+        / NULLIF(COUNT(V_CARRIER_SAVINGS.SHIPMENT_ID), 0)
+
+  - name: average_potential_savings_per_ground_shipment
+    label: Average potential savings per ground shipment
+    description: >
+      Average ground-to-ground carrier-selection savings in USD per ground
+      shipment (including shipments with zero savings). Useful for sizing
+      savings on projected future volume.
+    type: ratio
+    type_params:
+      numerator: ground_potential_savings_base
+      denominator: ground_shipment_base
+    meta:
+      table: V_CARRIER_SAVINGS
+      format: currency_usd
+      sql_expression: AVG(V_CARRIER_SAVINGS.POTENTIAL_SAVINGS)
+
+  # ===========================================================================
+  # Marketplace
+  # ===========================================================================
+  - name: active_seller_count
+    label: Active seller count
+    description: >
+      Distinct marketplace sellers (CUSTOMER_ID) with at least one shipped
+      label in the period. Unlike seller_count (all sellers on file), this
+      counts sellers actually shipping. Direct-merchant shipments have a NULL
+      CUSTOMER_ID and are not counted.
+    type: simple
+    type_params:
+      measure: active_sellers
+    meta:
+      table: SHIPMENTS
+      format: integer
+      sql_expression: >-
+        COUNT(DISTINCT CASE WHEN SHIPMENTS.IS_REFUNDED = FALSE
+        THEN SHIPMENTS.CUSTOMER_ID END)
+
+  # ===========================================================================
+  # Hidden helper metrics (ratio building blocks; not for direct use)
+  # ===========================================================================
+  - name: shipped_label_count_base
+    label: Shipped label count (base)
+    type: simple
+    type_params: {measure: shipped_labels}
+    meta: {hidden: true}
+  - name: adjusted_shipment_count_base
+    label: Adjusted shipment count (base)
+    type: simple
+    type_params: {measure: adjusted_shipments}
+    meta: {hidden: true}
+  - name: adjusted_shipment_adjustment_base
+    label: Adjusted shipment adjustment amount (base)
+    type: simple
+    type_params: {measure: adjusted_shipment_adjustment_amount}
+    meta: {hidden: true}
+  - name: shipped_effective_cost_base
+    label: Shipped effective cost (base)
+    type: simple
+    type_params: {measure: shipped_effective_cost}
+    meta: {hidden: true}
+  - name: shipped_billed_pounds_base
+    label: Shipped billed pounds (base)
+    type: simple
+    type_params: {measure: shipped_billed_pounds}
+    meta: {hidden: true}
+  - name: premium_service_shipment_base
+    label: Premium service shipments (base)
+    type: simple
+    type_params: {measure: premium_service_shipments}
+    meta: {hidden: true}
+  - name: far_zone_shipment_base
+    label: Far-zone shipments (base)
+    type: simple
+    type_params: {measure: far_zone_shipments}
+    meta: {hidden: true}
+  - name: shipped_retail_savings_base
+    label: Shipped retail savings (base)
+    type: simple
+    type_params: {measure: shipped_retail_savings}
+    meta: {hidden: true}
+  - name: shipped_list_rate_base
+    label: Shipped list rate (base)
+    type: simple
+    type_params: {measure: shipped_list_rate}
+    meta: {hidden: true}
+  - name: late_shipment_base
+    label: Late shipments (base)
+    type: simple
+    type_params: {measure: late_shipments}
+    meta: {hidden: true}
+  - name: scan_event_base
+    label: Scan events (base)
+    type: simple
+    type_params: {measure: scan_events}
+    meta: {hidden: true}
+  - name: scanned_shipment_base
+    label: Scanned shipments (base)
+    type: simple
+    type_params: {measure: scanned_shipments}
+    meta: {hidden: true}
+  - name: overpaid_ground_shipment_base
+    label: Overpaid ground shipments (base)
+    type: simple
+    type_params: {measure: overpaid_ground_shipments}
+    meta: {hidden: true}
+  - name: ground_shipment_base
+    label: Ground shipments (base)
+    type: simple
+    type_params: {measure: ground_shipments}
+    meta: {hidden: true}
+  - name: ground_potential_savings_base
+    label: Ground potential savings (base)
+    type: simple
+    type_params: {measure: ground_potential_savings}
+    meta: {hidden: true}
